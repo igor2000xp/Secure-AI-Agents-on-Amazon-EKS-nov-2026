@@ -1,0 +1,92 @@
+# Vendored upstream Kubernetes manifests — single source of truth.
+#
+# WHY THESE ARE VENDORED: null_resource.gateway_crds used to `kubectl apply -f
+# <url>` these files straight from github.com / raw.githubusercontent.com at
+# apply time. GitHub rate-limits by source IP, and a Workshop Studio provision
+# runs from CodeBuild behind a shared NAT egress address, so a real event failed
+# with:
+#
+#   error: unable to read URL "https://raw.githubusercontent.com/envoyproxy/
+#   ai-gateway/v1.0.0/manifests/charts/ai-gateway-crds-helm/templates/
+#   aigateway.envoyproxy.io_aigatewayroutes.yaml",
+#   server reported 429 Too Many Requests, status code=429
+#
+# With 11 files fetched back-to-back, that is 11 chances to trip a 429 on every
+# single provision. Vendoring removes GitHub from the provisioning path entirely:
+# the files ship inside terraform.zip and apply from disk.
+#
+# HOW TO UPDATE A VERSION:
+#   1. Bump `version` for the project below.
+#   2. Run: scripts/vendor-manifests.sh sync
+#   3. Commit the new files, the deleted old-version directory, and sources.lock.
+#
+# Terraform reads the versions straight out of this file (yamldecode in
+# gateways.tf), so this is the ONLY place a version is written down — no .tf edit
+# is needed to bump one.
+#
+# Files land in: terraform/manifests/vendor/<project>/<version>/<file>
+# The version is in the path so the vendored tree is self-documenting and two
+# versions can coexist during an upgrade.
+
+projects:
+  gateway-api:
+    repo: kubernetes-sigs/gateway-api
+    version: v1.5.1
+    # Experimental channel: our AI-gateway manifest uses BackendTLSPolicy
+    # v1alpha3, which the standard channel does not ship.
+    url_template: https://github.com/{repo}/releases/download/{version}/{file}
+    files:
+      - experimental-install.yaml
+
+  envoy-gateway:
+    repo: envoyproxy/gateway
+    version: v1.8.1
+    # Envoy Gateway's own CRDs (envoyproxies, backends, *policies), published as
+    # a standalone release asset.
+    url_template: https://github.com/{repo}/releases/download/{version}/{file}
+    files:
+      - envoy-gateway-crds.yaml
+
+  envoy-ai-gateway:
+    repo: envoyproxy/ai-gateway
+    version: v1.0.0
+    # Only shipped inside the Helm chart, but these template files are plain CRDs
+    # with no Helm directives, so they apply as-is.
+    url_template: https://raw.githubusercontent.com/{repo}/{version}/manifests/charts/ai-gateway-crds-helm/templates/{file}
+    files:
+      - aigateway.envoyproxy.io_aigatewayroutes.yaml
+      - aigateway.envoyproxy.io_aiservicebackends.yaml
+      - aigateway.envoyproxy.io_backendsecuritypolicies.yaml
+      - aigateway.envoyproxy.io_gatewayconfigs.yaml
+      - aigateway.envoyproxy.io_mcproutes.yaml
+      - aigateway.envoyproxy.io_quotapolicies.yaml
+
+  agent-sandbox:
+    repo: kubernetes-sigs/agent-sandbox
+    version: v1.0.10
+    # The sandbox control plane: Sandbox / SandboxClaim / SandboxTemplate /
+    # SandboxWarmPool CRDs plus the controller. Unlike the CRD-only projects
+    # below, this asset carries the whole install (Namespace, ServiceAccount,
+    # ClusterRoles, Service, Deployment).
+    #
+    # `sandbox-with-extensions.yaml` is the combined asset: upstream also ships
+    # `sandbox.yaml` (core) and `extensions.yaml` (the Template/WarmPool/Claim
+    # layer) separately, but we want both and one file applies in one pass.
+    #
+    # The Deployment references registry.k8s.io/agent-sandbox/
+    # agent-sandbox-controller:<version>; codebuild-images.tf mirrors that into
+    # ECR and agent-sandbox.tf repoints the manifest at the mirror, so no node
+    # pulls from registry.k8s.io at runtime.
+    url_template: https://github.com/{repo}/releases/download/{version}/{file}
+    files:
+      - sandbox-with-extensions.yaml
+
+  agentgateway:
+    repo: agentgateway/agentgateway
+    version: v1.3.1
+    # Same situation as envoy-ai-gateway: chart templates that are plain CRDs.
+    url_template: https://raw.githubusercontent.com/{repo}/{version}/controller/install/helm/agentgateway-crds/templates/{file}
+    files:
+      - agentgateway.dev_agentgatewaybackends.yaml
+      - agentgateway.dev_agentgatewayparameters.yaml
+      - agentgateway.dev_agentgatewaypolicies.yaml

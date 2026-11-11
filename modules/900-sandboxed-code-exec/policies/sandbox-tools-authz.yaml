@@ -1,0 +1,47 @@
+# Authorize the agent-sandbox MCP tools for the sales-analyst persona only.
+#
+# JWT authentication is enforced gateway-wide by module 700 (the mcp-authn
+# policy on the agentgateway Gateway); this policy targets the sandbox backend
+# and checks the cognito:groups claim, exactly like step3-differentiate.yaml
+# does for the orders backend.
+#
+# WHY THIS MATTERS MORE HERE THAN ELSEWHERE. The upstream MCP server ships with
+# no authentication of its own: anything that reaches its port can create
+# sandboxes, run arbitrary commands, and read or write files in every namespace
+# its ServiceAccount can touch. This policy and the ClusterIP-only Service are
+# what stand in front of that. Deleting this file does not "open up a lab tool";
+# it hands every authenticated persona a remote code execution primitive.
+#
+# matchExpressions are OR'd, so a call is allowed if ANY expression matches.
+# Every expression below ANDs the group check, so there is no tool a
+# support-associate can reach on this backend.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: sandbox-mcp-tool-authz
+  namespace: default
+spec:
+  targetRefs:
+    - kind: AgentgatewayBackend
+      name: sandbox-mcp-backend
+      group: agentgateway.dev
+  backend:
+    mcp:
+      authorization:
+        action: Allow
+        policy:
+          matchExpressions:
+            # The five calls one analysis run needs: claim a sandbox, put the
+            # data and the code in, run it, read the chart back, release it.
+            - 'mcp.tool.name == "create_sandbox" && "sales-analyst" in jwt["cognito:groups"]'
+            - 'mcp.tool.name == "upload_file" && "sales-analyst" in jwt["cognito:groups"]'
+            - 'mcp.tool.name == "execute_command" && "sales-analyst" in jwt["cognito:groups"]'
+            - 'mcp.tool.name == "download_file" && "sales-analyst" in jwt["cognito:groups"]'
+            - 'mcp.tool.name == "delete_sandbox" && "sales-analyst" in jwt["cognito:groups"]'
+            # Read-only status, so the agent can explain a slow cold start
+            # instead of hanging.
+            - 'mcp.tool.name == "get_sandbox_status" && "sales-analyst" in jwt["cognito:groups"]'
+            # Deliberately NOT allowed, for any persona: list_files and
+            # file_exists. The agent knows what it uploaded, so they buy
+            # nothing, and every tool left reachable is extra surface on a
+            # server that has no auth of its own.

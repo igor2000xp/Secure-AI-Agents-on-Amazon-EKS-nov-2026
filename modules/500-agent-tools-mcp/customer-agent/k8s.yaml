@@ -1,0 +1,92 @@
+# The agent no longer touches DynamoDB: lookup_order moved to the MCP server in
+# this lab, so the agent gets its own ServiceAccount with NO Pod Identity
+# association and therefore no AWS permissions at all. The DynamoDB role stays
+# on the "agent" ServiceAccount, which is now used only by the mcp-server pod
+# (see mcp-server/k8s.yaml). The tool moved, and its identity moved with it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: customer-agent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: customer-agent
+  template:
+    metadata:
+      labels:
+        app: customer-agent
+    spec:
+      serviceAccountName: customer-agent
+      containers:
+        - name: customer-agent
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/customer-agent:mcp
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          # Named keys instead of `envFrom: agent-config`. The blanket import
+          # would also hand this pod ORDERS_TABLE and AWS_REGION, which it has
+          # no use for now that the order tools live behind MCP.
+          env:
+            # Reach the MCP server THROUGH the cluster-internal agentgateway
+            # proxy (not the mcp-server Service directly). The /mcp route +
+            # AgentgatewayBackend are defined in mcp-server/k8s.yaml.
+            - name: MCP_SERVER_URL
+              value: "http://agentgateway.agentgateway-system.svc.cluster.local/mcp"
+            - name: MODEL_BASE_URL
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MODEL_BASE_URL }
+            - name: MODEL_ID
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MODEL_ID }
+            - name: MODEL_API_KEY
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MODEL_API_KEY }
+            # search_products stays in-process, so the agent still needs Milvus.
+            - name: MILVUS_URI
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MILVUS_URI }
+            - name: LANGFUSE_BASE_URL
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: LANGFUSE_BASE_URL }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  { name: agent-config, key: OTEL_EXPORTER_OTLP_ENDPOINT }
+            - name: OTEL_SERVICE_NAME
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: OTEL_SERVICE_NAME }
+            - name: OTEL_METRICS_EXPORTER
+              valueFrom:
+                configMapKeyRef:
+                  { name: agent-config, key: OTEL_METRICS_EXPORTER }
+            - name: OTEL_LOGS_EXPORTER
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: OTEL_LOGS_EXPORTER }
+          envFrom:
+            # Langfuse credentials come from a Secret, not the ConfigMap.
+            - secretRef:
+                name: langfuse-keys
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-agent
+spec:
+  selector:
+    app: customer-agent
+  ports:
+    - port: 8080
+      targetPort: 8080

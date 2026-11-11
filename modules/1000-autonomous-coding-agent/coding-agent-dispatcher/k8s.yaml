@@ -1,0 +1,166 @@
+# Coding-agent dispatcher (module 1000). SA "coding-agent" (ns default) claims
+# single-use sandboxes from the agent-sandbox warm pool in ns agent-sandbox
+# (Role/RoleBinding below). Bot creds + webhook secret come from the
+# coding-agent-creds Secret (written by gitea-provision.tf).
+#
+# No sandbox namespace is created here any more: sandboxes live in the
+# platform's agent-sandbox namespace alongside their SandboxTemplate and warm
+# pool, which terraform/agent-sandbox.tf installs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coding-agent
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coding-agent-dispatcher
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coding-agent
+  template:
+    metadata:
+      labels:
+        app: coding-agent
+    spec:
+      serviceAccountName: coding-agent
+      containers:
+        - name: coding-agent-dispatcher
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/coding-agent-dispatcher:v7
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef: { name: coding-agent-creds, key: webhook-secret }
+            - name: BOT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: coding-agent-creds, key: bot-username }
+            - name: BOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: coding-agent-creds, key: bot-password }
+            - name: TRIGGER_LABEL
+              valueFrom:
+                secretKeyRef: { name: coding-agent-creds, key: trigger-label }
+            - name: GITEA_API_URL
+              value: http://gitea-http.gitea.svc.cluster.local:3000/api/v1
+            # Warm pool to claim from, and the namespace holding it. The
+            # analysis lab claims a different pool in the same namespace, so the
+            # two never collide on the ~1-sandbox-per-node ceiling.
+            - name: SANDBOX_WARMPOOL
+              value: coding-agent-pool
+            - name: SANDBOX_NAMESPACE
+              value: agent-sandbox
+            # NOTE: the runtime class and the sandbox image are NOT set here any
+            # more. Both live in the SandboxTemplate
+            # (terraform/manifests/agent-sandbox-coding-template.yaml), which is
+            # what the warm pool boots from — the dispatcher no longer builds a
+            # pod spec at all.
+            # Model path + in-cluster endpoints injected into the coding sandbox.
+            # Explicit here (not code defaults) so the gateway route / model
+            # aliases can be changed without rebuilding the dispatcher image.
+            - name: GITEA_INTERNAL_URL
+              value: http://gitea-http.gitea.svc.cluster.local:3000
+            - name: MODEL_BASE_URL
+              value: http://ai-gateway.envoy-gateway-system.svc.cluster.local/anthropic
+            - name: MODEL_MAIN
+              value: claude-sonnet
+            - name: MODEL_SMALL
+              value: claude-haiku
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          resources:
+            requests: { cpu: "256m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coding-agent-dispatcher
+  namespace: default
+spec:
+  selector:
+    app: coding-agent
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+# Dispatcher RBAC: claim and read sandboxes. Notably SMALLER than before —
+# creating pods, exec'ing into them and reading their logs are all now the
+# controller's and sandboxd's jobs, so the dispatcher needs none of those verbs.
+# It cannot exec into an arbitrary pod in the cluster any more.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coding-agent-sandbox
+  namespace: agent-sandbox
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coding-agent-sandbox
+  namespace: agent-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: coding-agent
+    namespace: default
+roleRef:
+  kind: Role
+  name: coding-agent-sandbox
+  apiGroup: rbac.authorization.k8s.io
+---
+# The SandboxTemplate's spec.networkPolicy carries the egress allowlist for the
+# two in-cluster services, but it can only express pod/namespace/CIDR selectors
+# — there is no domainNames field in the CRD. So the one allowed EXTERNAL domain
+# still needs this AWS ApplicationNetworkPolicy, which matches on DNS names.
+#
+# Egress policies selecting the same pods are additive, so this grants
+# docs.aws.amazon.com:443 ON TOP of the template's rules. It selects every sandbox
+# pod via the sandbox-name-hash label the agent-sandbox controller stamps on
+# them, so it covers both warm-pool and cold-started guests.
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: coding-sandbox-dns-egress
+  namespace: agent-sandbox
+spec:
+  podSelector:
+    matchExpressions:
+      - key: agents.x-k8s.io/sandbox-name-hash
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # CoreDNS. Its ClusterIP is the .0.10 address of the cluster Service
+        # CIDR, which terraform/base.tf pins to 172.20.0.0/16 precisely so this
+        # literal is predictable — EKS otherwise picks 10.100.0.0/16 or
+        # 172.20.0.0/16 per cluster. An ipBlock is required here because a
+        # ClusterIP belongs to no pod, so a podSelector cannot match it.
+        - ipBlock: { cidr: 172.20.0.10/32 }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The single allowlisted external domain. Deliberately a domain the lab does
+    # NOT then ask the agent to fetch: the lab's demo issue sends it at
+    # aws.amazon.com, which is absent from this list and so is denied. Keeping
+    # one name allowed and one denied is what shows participants this is an
+    # allowlist rather than a blanket egress block.
+    - to:
+        - domainNames:
+            - "docs.aws.amazon.com"
+            - "pypi.org"
+            - "files.pythonhosted.org"
+      ports:
+        - { protocol: TCP, port: 443 }

@@ -1,0 +1,82 @@
+# OTel Collector (ADOT-operator-managed) → Langfuse, + agentgateway tracing.
+#
+# Single authenticated egress to Langfuse for BOTH gateways:
+#   - Envoy AI Gateway extProc  → this collector (OTLP/HTTP :4318)  [see gateways.tf]
+#   - agentgateway              → this collector (OTLP/gRPC :4317)  [AgentgatewayPolicy below]
+#
+# Why a collector: agentgateway's AgentgatewayPolicy.frontend.tracing has no
+# header field (verified v1.3.1 CRD), so it cannot send the HTTP Basic auth that
+# Langfuse's OTLP endpoint REQUIRES. The collector adds that header on egress.
+#
+# __LANGFUSE_AUTH__ is sed-substituted by observability.tf with
+# base64("<pk>:<sk>") from the langfuse_pk/sk locals (same placeholder pattern
+# as __REGION__ in envoy-ai-gateway-bedrock.yaml).
+#
+# apiVersion: the ADOT-shipped OTel operator (EKS default addon v0.151.x) serves
+# opentelemetry.io/v1beta1 as the stable OpenTelemetryCollector version. The
+# operator creates a Service named "<cr-name>-collector" — here
+# "agentgateway-traces-collector" in ns telemetry — referenced by the
+# AgentgatewayPolicy and the Envoy extProc endpoint. Re-verify both live at
+# deploy (see observability.tf header).
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: agentgateway-traces
+  namespace: telemetry
+spec:
+  mode: deployment
+  replicas: 1
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      # Drop the OpenTelemetry ASGI "http send" / "http receive" child spans.
+      # FastAPI auto-instrumentation emits one span per ASGI send event, so a
+      # STREAMED (SSE) /chat response produces dozens of empty 0.00s
+      # "POST /chat http send" spans that bury the useful ones (LLM calls, tool
+      # calls). This drops only those internal spans; the "POST /chat" server
+      # span (trace root) and the outbound "POST" httpx spans are kept.
+      filter/drop_asgi_internal:
+        error_mode: ignore
+        traces:
+          span:
+            - 'IsMatch(name, " http (send|receive)$")'
+      batch: {}
+    exporters:
+      otlphttp/langfuse:
+        endpoint: http://langfuse-web.langfuse.svc.cluster.local:3000/api/public/otel
+        headers:
+          Authorization: "Basic __LANGFUSE_AUTH__"
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [filter/drop_asgi_internal, batch]
+          exporters: [otlphttp/langfuse]
+---
+# Gateway-wide tracing for agentgateway → the collector's gRPC receiver.
+# targetRefs the agentgateway Gateway, which serves ONLY the MCP + A2A routes,
+# so exactly that traffic is traced. Stable-named so it composes with a future
+# authz AgentgatewayPolicy on the same Gateway/routes.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: tracing
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - kind: Gateway
+      name: agentgateway
+      group: gateway.networking.k8s.io
+  frontend:
+    tracing:
+      backendRef:
+        name: agentgateway-traces-collector
+        namespace: telemetry
+        port: 4317
+      protocol: GRPC

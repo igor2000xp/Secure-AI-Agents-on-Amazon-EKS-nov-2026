@@ -1,0 +1,68 @@
+# Warm pool of sandbox-capable node capacity.
+#
+# Nitro Sandbox pods land on nodes that advertise a free
+# `eks.amazonaws.com/nitro-sandbox` slot. On EKS Auto Mode such a node is
+# provisioned on demand, which costs minutes of EC2 provisioning before the
+# first sandbox of a lab can start. The sandbox itself boots in seconds, so the
+# slow part is the node, not the micro-VM.
+#
+# This Deployment holds that node open. Its pod is a real sandbox — same
+# RuntimeClass, same overhead, so Auto Mode provisions a genuinely
+# sandbox-capable instance — but it runs at NEGATIVE priority. When a lab's
+# sandbox pod needs the slot, the scheduler preempts this placeholder and the
+# real pod lands on the already-running node.
+#
+# Applied by terraform/sandbox-warm-pool.tf.
+#
+# Sizing: `requests` plus `overhead` decide the instance shape, so a placeholder
+# smaller than a real sandbox would reserve a node that cannot host one. These
+# values are deliberately at or above the largest sandbox the labs create (the
+# analysis sandbox asks cpu 1 / 768Mi, the coding sandbox cpu 2 / 4Gi), so the
+# reserved node fits either.
+#
+# Cost: each replica keeps one instance running continuously. Scale to 0 outside
+# an event, or raise `replicas` to the number of CONCURRENT sandboxes you want
+# to start without waiting — roughly one sandbox fits per node, so one replica
+# warms capacity for one concurrent run.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: sandbox-warm-pool
+value: -10
+# Never preempt anything itself; it only exists to be preempted.
+preemptionPolicy: Never
+globalDefault: false
+description: "Placeholder pods reserving sandbox-capable node capacity."
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-warm-pool
+  labels:
+    app: sandbox-warm-pool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandbox-warm-pool
+  template:
+    metadata:
+      labels:
+        app: sandbox-warm-pool
+    spec:
+      priorityClassName: sandbox-warm-pool
+      runtimeClassName: isolated-sandbox
+      # Preemption otherwise waits out the 30s default grace period, which is
+      # most of the latency this pool exists to remove.
+      terminationGracePeriodSeconds: 0
+      overhead:
+        eks.amazonaws.com/nitro-sandbox: "1"
+        memory: 256Mi
+      containers:
+        - name: pause
+          image: public.ecr.aws/docker/library/busybox:latest
+          command: ["sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 6Gi

@@ -1,0 +1,19 @@
+FROM public.ecr.aws/docker/library/python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/all-MiniLM-L6-v2', cache_dir='/app/.fastembed_cache')"
+
+FROM public.ecr.aws/docker/library/python:3.12-slim
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /app/.fastembed_cache /app/.fastembed_cache
+COPY product_agent.py .
+# Select the OTLP-HTTP exporter; distro defaults to the gRPC one we don't
+# install (would crash: "otlp_proto_grpc not found").
+ENV OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+# opentelemetry-instrument auto-instruments httpx (outbound traceparent) so the
+# gateway span nests under this agent's Langfuse trace. Launcher binary comes
+# from the builder stage's /usr/local/bin (copied above). See requirements.txt.
+CMD ["opentelemetry-instrument", "python", "product_agent.py"]

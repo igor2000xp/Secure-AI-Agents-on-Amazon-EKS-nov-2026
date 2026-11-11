@@ -1,0 +1,6 @@
+# mcp 2.0 renamed FastMCP to MCPServer and dropped mcp.server.fastmcp, which
+# server.py imports. The 1.10 floor is where mcp.server.transport_security first
+# appears (also imported by server.py); 1.8/1.9 resolve but fail at import.
+mcp[cli]>=1.10,<2
+uvicorn
+boto3

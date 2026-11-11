@@ -1,0 +1,205 @@
+# Envoy AI Gateway → Amazon Bedrock.
+#
+# A LiteLLM-style OpenAI front for Bedrock: clients speak the OpenAI wire format
+# (input schema OpenAI on the AIGatewayRoute) and the gateway translates to
+# Bedrock's native Converse API (output schema AWSBedrock on the
+# AIServiceBackend). The Converse API is unified across model families, so a
+# SINGLE AWSBedrock backend serves Nova AND Claude — no per-family backend split.
+#
+# Cluster-internal (ClusterIP, no ALB). Auth is SigV4 via EKS Pod Identity
+# (BackendSecurityPolicy type AWSCredentials) — the ai-gateway-dataplane-aws
+# ServiceAccount is bound to the Bedrock role in gateways.tf, so no API keys.
+#
+# Placeholders __REGION__ / __BEDROCK_HOST__ are substituted by `sed` in
+# gateways.tf before `kubectl apply` (the same pattern used by the other
+# templated manifests in this directory).
+#
+# Model aliases match the LiteLLM model_list (nova-lite/pro/micro,
+# claude-sonnet/haiku), so agent code is identical whether it points at LiteLLM
+# or this gateway. The client sends the alias as the OpenAI `model`;
+# modelNameOverride rewrites it to the real Bedrock model ID before the call.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-gateway-dataplane-aws
+  namespace: envoy-gateway-system
+---
+# Cluster-internal Envoy proxy (ClusterIP, not a LoadBalancer) bound to the
+# Pod Identity ServiceAccount above.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: ai-gateway-with-aws
+  namespace: envoy-ai-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyServiceAccount:
+        name: ai-gateway-dataplane-aws
+      envoyService:
+        type: ClusterIP
+        # Pin the generated data-plane Service name (otherwise Envoy Gateway
+        # appends an unpredictable hash: envoy-<ns>-<gw>-<hash>). Agents reach
+        # it via MODEL_BASE_URL as
+        # http://ai-gateway.envoy-gateway-system.svc.cluster.local/v1
+        # NB: the Service is created in the Envoy Gateway CONTROLLER namespace
+        # (envoy-gateway-system), not this manifest's envoy-ai-gateway-system.
+        name: ai-gateway
+---
+# GatewayClass the Gateway below hangs off of. The ai-gateway-helm chart ships
+# ONLY the controller — it does NOT create a GatewayClass — so we must define it
+# ourselves. Without this, the Gateway stays Accepted/Programmed: Unknown and NO
+# data-plane proxy is ever created (the AI Gateway serves nothing). The
+# controllerName is Envoy Gateway's fixed gatewayclass controller (confirmed via
+# the envoy-gateway-config ConfigMap: gateway.envoyproxy.io/gatewayclass-controller).
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy-ai-gateway
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: envoy-ai-gateway
+  namespace: envoy-ai-gateway-system
+spec:
+  gatewayClassName: envoy-ai-gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: ai-gateway-with-aws
+---
+# Raise the per-connection request buffer limit above Envoy's 32768-byte default.
+# Agents carry multi-turn conversations plus tool results (e.g. sandbox
+# output) in each /v1/chat/completions request; once a conversation accumulates
+# past ~32KB the AI gateway rejects it with 413 request_payload_too_large (the
+# LLM call fails and the agent's SSE stream closes -> "peer closed connection").
+# 4Mi is comfortable headroom for tool-augmented conversations.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: ai-gateway-buffer-limit
+  namespace: envoy-ai-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: envoy-ai-gateway
+  connection:
+    bufferLimit: 4Mi
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: bedrock
+  namespace: envoy-ai-gateway-system
+spec:
+  parentRefs:
+    - name: envoy-ai-gateway
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  # One rule per friendly alias. x-ai-eg-model carries the client's OpenAI
+  # `model` value; modelNameOverride on the backendRef rewrites it to the real
+  # Bedrock model ID before the request is forwarded.
+  rules:
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: nova-lite
+      backendRefs:
+        - name: bedrock
+          modelNameOverride: us.amazon.nova-2-lite-v1:0
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: nova-pro
+      backendRefs:
+        - name: bedrock
+          modelNameOverride: us.amazon.nova-pro-v1:0
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: nova-micro
+      backendRefs:
+        - name: bedrock
+          modelNameOverride: us.amazon.nova-micro-v1:0
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: claude-sonnet
+      backendRefs:
+        - name: bedrock
+          modelNameOverride: us.anthropic.claude-sonnet-5-5
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: claude-haiku
+      backendRefs:
+        - name: bedrock
+          modelNameOverride: us.anthropic.claude-haiku-4-5-20251001-v1:0
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIServiceBackend
+metadata:
+  name: bedrock
+  namespace: envoy-ai-gateway-system
+spec:
+  schema:
+    name: AWSBedrock
+  backendRef:
+    name: bedrock
+    kind: Backend
+    group: gateway.envoyproxy.io
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: BackendSecurityPolicy
+metadata:
+  name: bedrock
+  namespace: envoy-ai-gateway-system
+spec:
+  targetRefs:
+    - group: aigateway.envoyproxy.io
+      kind: AIServiceBackend
+      name: bedrock
+  type: AWSCredentials
+  awsCredentials:
+    region: __REGION__
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: bedrock
+  namespace: envoy-ai-gateway-system
+spec:
+  endpoints:
+    - fqdn:
+        hostname: __BEDROCK_HOST__
+        port: 443
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: bedrock-tls
+  namespace: envoy-ai-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.envoyproxy.io
+      kind: Backend
+      name: bedrock
+  validation:
+    wellKnownCACertificates: "System"
+    hostname: __BEDROCK_HOST__

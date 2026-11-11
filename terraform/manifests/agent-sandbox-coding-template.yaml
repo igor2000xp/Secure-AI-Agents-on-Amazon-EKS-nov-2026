@@ -1,0 +1,140 @@
+# SandboxTemplate + SandboxWarmPool for the autonomous coding agent lab.
+#
+# Applied by terraform/agent-sandbox.tf, which sed's __ECR__ to the account's
+# registry. The coding-agent dispatcher claims from this pool for each labelled
+# git issue, drives Claude Code inside the guest, and releases the claim.
+#
+# HOW THIS DIFFERS FROM THE ANALYSIS TEMPLATE (agent-sandbox-template.yaml):
+#
+#   * Not air-gapped. Claude Code must reach the in-cluster AI gateway (model
+#     calls) and Gitea (clone / push / open PR), so this template carries an
+#     explicit egress ALLOWLIST instead of an absent egress list. Everything
+#     else — the public internet, direct Bedrock, IMDS, every other namespace —
+#     is still denied.
+#   * Bigger guest. A full clone plus `npm`/`pytest` plus Claude Code needs more
+#     than pandas does: cpu 2 / 4Gi, and an 8Gi writable overlay.
+#   * Different image. coding-runtime-sandbox carries git, Node and the Claude
+#     Code CLI on top of sandboxd.
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: coding-agent
+  namespace: agent-sandbox
+spec:
+  service: true
+
+  networkPolicy:
+    ingress:
+      # sandboxd's REST (files) and gRPC (exec) listeners, reachable only from
+      # the dispatcher. Nothing else in the cluster can drive this sandbox.
+      - from:
+          - podSelector:
+              matchLabels:
+                app: coding-agent
+            namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: default
+        ports:
+          - protocol: TCP
+            port: 8080
+          - protocol: TCP
+            port: 9090
+    egress:
+      # 1. DNS, to resolve the two service names below.
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+        ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
+      # 2. The Envoy AI Gateway data plane (model calls -> Bedrock).
+      #    IMPORTANT: a NetworkPolicy egress port matches the DESTINATION POD's
+      #    port AFTER Service translation, not the Service port. The ai-gateway
+      #    Service listens on 80 but its targetPort is 10080, so a rule naming
+      #    80/443 never matches and every model call is denied.
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: envoy-gateway-system
+            podSelector:
+              matchLabels:
+                gateway.envoyproxy.io/owning-gateway-name: envoy-ai-gateway
+        ports:
+          - protocol: TCP
+            port: 10080
+      # 3. In-cluster Gitea (clone / push / open PR).
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: gitea
+        ports:
+          - protocol: TCP
+            port: 3000
+
+  podTemplate:
+    spec:
+      # No AWS keys and no Kubernetes token in the guest. The only credential
+      # it ever holds is a per-run Gitea token the dispatcher writes in and
+      # revokes afterwards.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+
+      # Hardware isolation: a first-level guest of the AWS Nitro hypervisor
+      # with its own kernel.
+      runtimeClassName: isolated-sandbox
+      overhead:
+        eks.amazonaws.com/nitro-sandbox: "1"
+        memory: 256Mi
+      # A lingering sandbox holds a scarce per-node sandbox slot.
+      terminationGracePeriodSeconds: 0
+
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000
+
+      containers:
+        - name: sandboxd
+          image: __ECR__/coding-runtime-sandbox:v5
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: 8080 # REST: filesystem + health
+            - containerPort: 9090 # gRPC: ProcessService (exec)
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+          resources:
+            # Nitro Sandboxes size the guest from REQUESTS, not limits.
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              # The writable overlay is the one Nitro Sandboxes exception: it is
+              # sized from a LIMIT. A clone + node_modules + pytest artifacts
+              # needs room.
+              ephemeral-storage: 8Gi
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: coding-agent-pool
+  namespace: agent-sandbox
+spec:
+  sandboxTemplateRef:
+    name: coding-agent
+  # One pre-booted coding sandbox. Note this reserves a 2-vCPU/4Gi guest for the
+  # whole event, and roughly one sandbox fits per sandbox-capable node — so this
+  # plus the analysis pool is two nodes held. Scale to 0 outside an event.
+  replicas: 1

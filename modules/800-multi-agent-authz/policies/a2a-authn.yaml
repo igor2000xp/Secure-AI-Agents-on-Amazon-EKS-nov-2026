@@ -1,0 +1,48 @@
+# A2A authn — require an authenticated persona on the multi-agent (A2A) routes.
+#
+# The 700 module's jwtAuthentication is gateway-wide (targets the Gateway), so
+# the A2A HTTPRoutes are ALREADY authenticated. This policy adds the
+# deny-unauthenticated gate on the two specialist routes: a Require rule that
+# passes only when a validated JWT is present (has(jwt.sub)). Any authenticated
+# persona is allowed — A2A is authn-only; the differentiated per-tool authz
+# lives at the MCP layer (700).
+#
+# Route-grain: agentgateway has no per-A2A-method authz (the backend policy has
+# mcp/ai sub-keys, no a2a), so this uses the top-level `authorization` block on
+# the order-agent-a2a / product-agent-a2a HTTPRoutes (created in the routing
+# phase, ns default).
+#
+# One policy per route (targetRefs takes a single kind/name per HTTPRoute).
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: order-agent-a2a-authn
+  namespace: default
+spec:
+  targetRefs:
+    - kind: HTTPRoute
+      name: order-agent-a2a
+      group: gateway.networking.k8s.io
+  authorization:
+    action: Require
+    policy:
+      matchExpressions:
+        # Deny-by-default: allowed only when a validated JWT subject is present.
+        - 'has(jwt.sub)'
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: product-agent-a2a-authn
+  namespace: default
+spec:
+  targetRefs:
+    - kind: HTTPRoute
+      name: product-agent-a2a
+      group: gateway.networking.k8s.io
+  authorization:
+    action: Require
+    policy:
+      matchExpressions:
+        - 'has(jwt.sub)'

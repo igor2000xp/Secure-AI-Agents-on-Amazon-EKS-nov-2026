@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: customer-agent
+  template:
+    metadata:
+      labels:
+        app: customer-agent
+    spec:
+      serviceAccountName: agent
+      containers:
+        - name: customer-agent
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/customer-agent:langfuse
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          envFrom:
+            # Non-secret config (model endpoint, OTel target, LANGFUSE_BASE_URL).
+            - configMapRef:
+                name: agent-config
+            # LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY. Credentials live in a
+            # Secret, not the ConfigMap, so they are not readable by anything
+            # that can only read config.
+            - secretRef:
+                name: langfuse-keys
+          resources:
+            requests:
+              cpu: "256m"
+              memory: "512Mi"
+            limits:
+              cpu: "512m"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-agent
+spec:
+  selector:
+    app: customer-agent
+  ports:
+    - port: 8080
+      targetPort: 8080

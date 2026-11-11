@@ -1,0 +1,90 @@
+# The 900 customer-agent: same image code as 500 (new tag customer-agent:code-exec),
+# but MCP_SERVER_URLS points at BOTH the orders MCP and the agent-sandbox MCP
+# server, so the agent gains get_orders plus the sandbox lifecycle tools
+# (create_sandbox / upload_file / execute_command / download_file /
+# delete_sandbox) alongside lookup_order/check_inventory/initiate_return.
+#
+# Keeps the no-IAM customer-agent ServiceAccount introduced in module 500. The agent holds no
+# AWS permissions: the orders MCP server reads DynamoDB under the "agent"
+# ServiceAccount; the sandbox itself holds no credentials at all
+# (read-only Query). Rolling this Deployment forward must not hand the agent back
+# the DynamoDB role it stopped needing.
+#
+# Declared here too (identical to module 500's) so this manifest stands alone; apply
+# is idempotent, so re-applying it after that lab is a no-op.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: customer-agent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: customer-agent
+  template:
+    metadata:
+      labels:
+        app: customer-agent
+    spec:
+      serviceAccountName: customer-agent
+      containers:
+        - name: customer-agent
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/customer-agent:code-exec
+          imagePullPolicy: Always
+          env:
+            # Both MCP servers, through agentgateway (orders MCP + code broker).
+            - name: MCP_SERVER_URLS
+              value: "http://agentgateway.agentgateway-system.svc.cluster.local/mcp,http://agentgateway.agentgateway-system.svc.cluster.local/sandbox-mcp"
+            - name: MODEL_BASE_URL
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MODEL_BASE_URL }
+            - name: MODEL_ID
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MODEL_ID }
+            - name: MODEL_API_KEY
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MODEL_API_KEY }
+            - name: MILVUS_URI
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: MILVUS_URI }
+            - name: LANGFUSE_BASE_URL
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: LANGFUSE_BASE_URL }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  { name: agent-config, key: OTEL_EXPORTER_OTLP_ENDPOINT }
+            - name: OTEL_SERVICE_NAME
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: OTEL_SERVICE_NAME }
+            - name: OTEL_METRICS_EXPORTER
+              valueFrom:
+                configMapKeyRef:
+                  { name: agent-config, key: OTEL_METRICS_EXPORTER }
+            - name: OTEL_LOGS_EXPORTER
+              valueFrom:
+                configMapKeyRef: { name: agent-config, key: OTEL_LOGS_EXPORTER }
+          envFrom:
+            # Langfuse credentials come from a Secret, not the ConfigMap.
+            - secretRef:
+                name: langfuse-keys
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: "256m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-agent
+spec:
+  selector:
+    app: customer-agent
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -1,0 +1,20 @@
+FROM public.ecr.aws/docker/library/python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM public.ecr.aws/docker/library/python:3.12-slim
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY orchestrator.py server.py ./
+EXPOSE 8083
+# Select the OTLP-HTTP exporter; distro defaults to the gRPC one we don't
+# install (would crash: "otlp_proto_grpc not found").
+ENV OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+# opentelemetry-instrument auto-instruments httpx (outbound traceparent) and
+# FastAPI (inbound span) so the gateway span nests under this agent's Langfuse
+# trace. Launcher binary comes from the builder stage's /usr/local/bin. Note:
+# the orchestrator's A2A calls to specialists also get traceparent, so the
+# whole multi-agent flow shares one trace. See requirements.txt.
+CMD ["opentelemetry-instrument", "python", "server.py"]

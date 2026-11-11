@@ -1,0 +1,71 @@
+# Sample workload for AWS Nitro Sandboxes on EKS.
+#
+# This pod proves the sandboxed runtime works end to end: it requests the
+# `isolated-sandbox` RuntimeClass, so Kubernetes boots it inside its own
+# hardware-isolated micro-VM (a Nitro Sandbox: a first-level guest of the AWS
+# Nitro hypervisor, driven by a containerd shim) on a sandbox-capable Nitro
+# node. Each such pod runs its own Linux kernel; a compromise stays inside the
+# pod's VM instead of touching the node.
+#
+# Nitro Sandbox requirements (vs an ordinary pod):
+#   * runtimeClassName: isolated-sandbox        — the whole opt-in.
+#   * spec.overhead: the per-pod micro-VM tax, {eks.amazonaws.com/nitro-sandbox: "1",
+#     memory: 256Mi}. The extended resource "1" claims a sandbox slot; the
+#     memory is the guest/hypervisor overhead on top of the container request.
+#   * terminationGracePeriodSeconds: 0          — a lingering sandbox holds a
+#     scarce sandbox slot, so tear it down promptly.
+#   * resources.requests size the VM. The guest gets whole vCPUs and
+#     (request + 256Mi) of RAM, so a token 100m/64Mi request is far too small
+#     for a real micro-VM; we ask for cpu "1", memory 768Mi (the smallest
+#     useful sandbox).
+#
+# Scheduling note: we do NOT set a nodeSelector or tolerations here. The
+# `isolated-sandbox` RuntimeClass carries them, and the scheduler places the pod
+# on a node advertising a free `eks.amazonaws.com/nitro-sandbox` slot. EKS Auto
+# Mode provisions a sandbox-capable instance on demand when no existing node has
+# a free slot.
+#
+# It runs `sleep infinity` (busybox) rather than a pure pause container so you
+# can exec in and observe the isolation.
+#
+# Verify (this is a micro-VM, not a container sharing the node kernel):
+#   kubectl get runtimeclass isolated-sandbox
+#   kubectl get pod -l app=isolated-sandbox-sample -o wide          # lands on a sandbox-capable Nitro node
+#   kubectl exec deploy/isolated-sandbox-sample -- uname -r          # guest kernel != node kernel
+#   kubectl exec deploy/isolated-sandbox-sample -- ls /dev/nsm       # Nitro Security Module — present ONLY in the guest
+#   kubectl exec deploy/isolated-sandbox-sample -- ls /dev/nitro_enclaves 2>&1  # node-only device — ABSENT in the guest
+#   kubectl exec deploy/isolated-sandbox-sample -- sh -c 'cat /sys/class/dmi/id/product_name'  # shows an ".enclave" product
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: isolated-sandbox-sample
+  labels:
+    app: isolated-sandbox-sample
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: isolated-sandbox-sample
+  template:
+    metadata:
+      labels:
+        app: isolated-sandbox-sample
+    spec:
+      runtimeClassName: isolated-sandbox
+      terminationGracePeriodSeconds: 0
+      # Per-pod micro-VM overhead: claim one sandbox slot + hypervisor/guest memory.
+      overhead:
+        eks.amazonaws.com/nitro-sandbox: "1"
+        memory: 256Mi
+      containers:
+        - name: sleep
+          image: public.ecr.aws/docker/library/busybox:latest
+          command: ["sleep", "infinity"]
+          resources:
+            # requests size the VM: whole vCPU(s) + (memory request + 256Mi overhead).
+            requests:
+              cpu: "1"
+              memory: "768Mi"
+            limits:
+              cpu: "1"
+              memory: "768Mi"

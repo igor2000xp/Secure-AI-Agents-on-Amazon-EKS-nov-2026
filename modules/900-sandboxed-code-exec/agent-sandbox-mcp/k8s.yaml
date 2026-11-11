@@ -1,0 +1,170 @@
+# The upstream agent-sandbox MCP server, fronted by agentgateway.
+#
+# This is kubernetes-sigs/agent-sandbox's own integration
+# (clients/integrations/mcp-server), built from source into our ECR by
+# codebuild-images.tf. It exposes the sandbox lifecycle as MCP tools —
+# create_sandbox, upload_file, execute_command, download_file, delete_sandbox —
+# so the agent drives sandboxes through a Kubernetes-native API instead of a
+# bespoke broker.
+#
+# SECURITY: THIS SERVER HAS NO AUTHENTICATION OF ITS OWN.
+# Upstream's README is explicit: it serves streamable HTTP on 0.0.0.0:8000 and
+# "any client that can reach that port gets a fresh session and full access to
+# every tool (create sandboxes, execute arbitrary commands, read/write files)
+# across any namespace its Kubernetes service account can touch." Two things
+# contain that here:
+#   1. The Service is ClusterIP and the ONLY route to it is through
+#      agentgateway, which terminates the Cognito JWT and applies the per-tool
+#      authorization policy (see the Securing the agents lab). The agent never
+#      talks to :8000 directly.
+#   2. The ServiceAccount below is scoped to sandbox objects in ONE namespace.
+#      It deliberately has no `pods/exec`, no `pods/portforward`, and no access
+#      to Secrets — sandboxd's own API is how commands run.
+# Do not add a NodePort/LoadBalancer Service or an Ingress to this Deployment.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-sandbox-mcp-server
+---
+# Claims and reads sandboxes in the agent-sandbox namespace. These exact verbs
+# are what upstream documents the server needing; it needs nothing else, and
+# notably no pods/portforward, because it reaches sandboxd over cluster DNS.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-sandbox-mcp-server
+  namespace: agent-sandbox
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-sandbox-mcp-server
+  namespace: agent-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-mcp-server
+    namespace: default
+roleRef:
+  kind: Role
+  name: agent-sandbox-mcp-server
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-sandbox-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-sandbox-mcp-server
+  template:
+    metadata:
+      labels:
+        # Selected by the SandboxTemplate's NetworkPolicy ingress rule — this
+        # label is what admits the server to sandboxd's ports. Changing it
+        # without changing manifests/agent-sandbox-template.yaml silently
+        # breaks every sandbox connection.
+        app: agent-sandbox-mcp-server
+    spec:
+      serviceAccountName: agent-sandbox-mcp-server
+      containers:
+        - name: mcp-server
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/agent-sandbox-mcp-server:v1.0.10
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            # Talk to sandboxd directly. agent-sandbox v1.x removed the
+            # sandbox-router, and the router could never proxy sandboxd's gRPC
+            # ProcessService anyway, so this is the only in-cluster option.
+            - name: K8S_SANDBOX_CONNECTION__TYPE
+              value: "sandboxd-in-cluster"
+            # Resolve Sandbox.status.serviceFQDN (requires `service: true` on
+            # the SandboxTemplate) rather than the pod IP. Service mode
+            # survives a pod being replaced; neither mode falls back to the
+            # other.
+            - name: K8S_SANDBOX_CONNECTION__MODE
+              value: "in-cluster-service"
+            - name: K8S_SANDBOX_CONNECTION__REST_PORT
+              value: "8080"
+            - name: K8S_SANDBOX_CONNECTION__GRPC_PORT
+              value: "9090"
+            # The /readyz probe lists SandboxClaims here to prove the
+            # Kubernetes API is reachable, so it must be a namespace this SA
+            # can list claims in.
+            - name: K8S_SANDBOX_PROBE_NAMESPACE
+              value: "agent-sandbox"
+          # /healthz never touches the Kubernetes API, so a control-plane blip
+          # cannot cause a restart loop; /readyz does, and pulls the pod out of
+          # the Service instead. periodSeconds is deliberately slow because
+          # /readyz makes a real API call.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-sandbox-mcp-server
+spec:
+  selector:
+    app: agent-sandbox-mcp-server
+  ports:
+    - port: 8000
+      targetPort: 8000
+      # Tells agentgateway to speak MCP to this Service, same as the orders
+      # mcp-server.
+      appProtocol: agentgateway.dev/mcp
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: sandbox-mcp-backend
+spec:
+  mcp:
+    targets:
+      - name: agent-sandbox-mcp-server
+        static:
+          backendRef:
+            name: agent-sandbox-mcp-server
+          port: 8000
+          protocol: StreamableHTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: sandbox-mcp
+spec:
+  parentRefs:
+    - name: agentgateway
+      namespace: agentgateway-system
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /sandbox-mcp
+      backendRefs:
+        - name: sandbox-mcp-backend
+          group: agentgateway.dev
+          kind: AgentgatewayBackend

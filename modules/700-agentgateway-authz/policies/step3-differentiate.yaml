@@ -1,0 +1,84 @@
+# Step 3 — differentiate by persona.
+#
+# lookup_order stays open to everyone (from step 2). initiate_return (a
+# customer-service, mutating action) is additionally allowed, but ONLY for the
+# support-associate persona. matchExpressions use OR logic, so a call is allowed
+# if ANY expression matches:
+#   - lookup_order for anyone, OR
+#   - initiate_return AND the caller is in the support-associate Cognito group, OR
+#   - get_orders AND the caller is in the sales-analyst Cognito group.
+# check_inventory remains denied (no rule).
+#
+# One privileged tool per persona, which is the point of the step: the
+# support-associate can mutate an order, the sales-analyst can pull a whole
+# quarter for analysis (and feeds it to the sandbox in the Agents using a
+# sandbox lab), and neither can do the other's job.
+#
+# Expected: support-associate -> initiate_return WORKS, get_orders DENIED (403);
+# sales-analyst -> get_orders WORKS, initiate_return DENIED (403); lookup_order
+# works for both.
+#
+# CEL claim access: `cognito:groups` is a JWT claim whose name contains a colon
+# and whose value is an array. Authored as standard CEL map-index + membership:
+# `"support-associate" in jwt["cognito:groups"]`. VERIFIED LIVE (2026-07-06) on
+# agentgateway v1.3.1: jwt["cognito:groups"] resolves as a list and the rule
+# discriminates correctly (unauthorized tools are hidden at tools/list time).
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: cognito-jwks
+  namespace: agentgateway-system
+spec:
+  static:
+    host: __COGNITO_JWKS_HOST__
+    port: 443
+  policies:
+    tls: {}
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-authn
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - kind: Gateway
+      name: agentgateway
+      group: gateway.networking.k8s.io
+  traffic:
+    jwtAuthentication:
+      mode: Strict
+      providers:
+        - issuer: __COGNITO_ISSUER__
+          audiences:
+            - __COGNITO_CLIENT_ID__
+          jwks:
+            remote:
+              backendRef:
+                group: agentgateway.dev
+                kind: AgentgatewayBackend
+                name: cognito-jwks
+                namespace: agentgateway-system
+                port: 443
+              jwksPath: __COGNITO_JWKS_PATH__
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-tool-authz
+  namespace: default
+spec:
+  targetRefs:
+    - kind: AgentgatewayBackend
+      name: mcp-backend
+      group: agentgateway.dev
+  backend:
+    mcp:
+      authorization:
+        action: Allow
+        policy:
+          matchExpressions:
+            - 'mcp.tool.name == "lookup_order"'
+            - 'mcp.tool.name == "initiate_return" && "support-associate" in jwt["cognito:groups"]'
+            - 'mcp.tool.name == "get_orders" && "sales-analyst" in jwt["cognito:groups"]'

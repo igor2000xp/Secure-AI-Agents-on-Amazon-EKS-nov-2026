@@ -1,0 +1,25 @@
+strands-agents[openai,otel]
+strands-agents-tools
+langfuse
+pymilvus
+fastembed
+# MCP client only (mcp.client.streamable_http), which survives in 2.0. Pinned to
+# 1.x anyway to match the MCP servers and strands-agents' own mcp<2 constraint.
+mcp[cli]>=1.10,<2
+fastapi
+uvicorn
+# Direct dep: server.py fetches chart PNGs from the code-exec broker's
+# /chart/{id} route (module 900) to re-stream them to the UI as image events.
+httpx
+# OpenTelemetry zero-code instrumentation. The `opentelemetry-instrument`
+# launcher (Dockerfile CMD) patches httpx to propagate W3C traceparent on the
+# outbound LLM call, so the Envoy AI Gateway's span nests under this agent's
+# Langfuse trace. Unpinned so pip resolves against langfuse's OTel version.
+# opentelemetry-distro configures OTEL_TRACES_EXPORTER=otlp but bundles NO OTLP
+# exporter (only console), so the OTLP-HTTP exporter must be installed
+# explicitly or the launcher crashes ("otlp_proto_grpc/http not found"). Paired
+# with OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf in the Dockerfile.
+opentelemetry-distro
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-httpx
+opentelemetry-instrumentation-fastapi

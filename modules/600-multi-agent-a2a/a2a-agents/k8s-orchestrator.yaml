@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator-agent
+  template:
+    metadata:
+      labels:
+        app: orchestrator-agent
+    spec:
+      serviceAccountName: agent
+      containers:
+        - name: orchestrator-agent
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/orchestrator-agent:v1
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8083
+          envFrom:
+            - configMapRef:
+                name: agent-config
+            # Langfuse credentials come from a Secret, not the ConfigMap.
+            - secretRef:
+                name: langfuse-keys
+          env:
+            # Reach the A2A specialists THROUGH the cluster-internal agentgateway
+            # proxy (per-agent path prefixes, routes defined in
+            # k8s-specialists.yaml) instead of dialing their Services directly.
+            - name: ORDER_AGENT_URL
+              value: "http://agentgateway.agentgateway-system.svc.cluster.local/order-agent"
+            - name: PRODUCT_AGENT_URL
+              value: "http://agentgateway.agentgateway-system.svc.cluster.local/product-agent"
+          resources:
+            requests: { cpu: "256m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-agent
+spec:
+  selector:
+    app: orchestrator-agent
+  ports:
+    - port: 8083
+      targetPort: 8083

@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chainlit-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chainlit-ui
+  template:
+    metadata:
+      labels:
+        app: chainlit-ui
+    spec:
+      containers:
+        - name: chainlit-ui
+          image: public.ecr.aws/e9a3v2u0/chainlit-ui:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chainlit-ui
+spec:
+  selector:
+    app: chainlit-ui
+  ports:
+    - port: 80
+      targetPort: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chainlit-ui
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # NOTE: The chat UI is deployed by terraform/chatui.tf, not this manifest.
+    # inbound-cidrs is set explicitly so that IF someone applies this file, open
+    # access is an intentional choice rather than the AWS LB Controller's silent
+    # 0.0.0.0/0 default. Narrow this if you apply it in a long-lived account.
+    alb.ingress.kubernetes.io/inbound-cidrs: 0.0.0.0/0
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chainlit-ui
+                port:
+                  number: 80

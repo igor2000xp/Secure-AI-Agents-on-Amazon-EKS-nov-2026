@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-server
+  template:
+    metadata:
+      labels:
+        app: mcp-server
+    spec:
+      # The "agent" ServiceAccount carries the DynamoDB Pod Identity. As of this
+      # lab this pod is its only user: lookup_order runs here now, so the data
+      # access belongs here too. The agent runs under its own no-IAM
+      # ServiceAccount (see customer-agent/k8s.yaml).
+      serviceAccountName: agent
+      containers:
+        - name: mcp-server
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/mcp-server:v2
+          imagePullPolicy: Always
+          # The MCP server's lookup_order tool reads the orders DynamoDB table,
+          # so it needs ORDERS_TABLE + AWS_REGION from the agent-config ConfigMap
+          # (same as customer-agent and the a2a order_agent). Without this the
+          # container crashes at import: KeyError: 'ORDERS_TABLE'.
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "256m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server
+spec:
+  selector:
+    app: mcp-server
+  ports:
+    - port: 8080
+      targetPort: 8080
+      # Tells agentgateway to speak the MCP protocol to this Service. Required
+      # for the AgentgatewayBackend below to proxy MCP correctly.
+      appProtocol: agentgateway.dev/mcp
+---
+# Route MCP traffic through the cluster-internal agentgateway proxy instead of
+# agents connecting to this Service directly. Agents set
+# MCP_SERVER_URL=http://agentgateway.agentgateway-system.svc.cluster.local/mcp.
+#
+# The HTTPRoute has a stable name ("mcp") and there is one route per backend, so
+# a future AgentgatewayPolicy (authn/authz or tracing) can targetRef it without
+# restructuring. See the mcp-a2a-via-agentgateway design.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-backend
+spec:
+  mcp:
+    targets:
+      - name: mcp-server
+        static:
+          # backendRef points at the in-cluster Service by name (avoids
+          # hardcoding cluster DNS); port + protocol stay on the target.
+          backendRef:
+            name: mcp-server
+          port: 8080
+          protocol: StreamableHTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp
+spec:
+  parentRefs:
+    - name: agentgateway
+      namespace: agentgateway-system
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+      backendRefs:
+        - name: mcp-backend
+          group: agentgateway.dev
+          kind: AgentgatewayBackend

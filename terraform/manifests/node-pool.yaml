@@ -1,0 +1,96 @@
+# Workshop node pool — replaces EKS Auto Mode's built-in `general-purpose` pool.
+#
+# Applied by terraform/node-pool.tf. The built-in pool is switched off in
+# base.tf (`compute_config.node_pools` keeps only "system"), because the
+# EKS-managed NodePools cannot be edited in place: changing their disruption
+# settings or requirements means replacing them with one of your own.
+#
+# WHY WE REPLACE IT
+#
+# 1. Disruption. The built-in pool runs `consolidationPolicy:
+#    WhenEmptyOrUnderutilized` with `consolidateAfter: 30s`, so Karpenter
+#    repacks the cluster whenever it thinks a node is underutilized — draining
+#    and replacing nodes that are still doing work. During a workshop that
+#    shows up as agents and gateways restarting mid-lab for no reason the
+#    participant can see. `WhenEmpty` keeps the cost cleanup (an idle node is
+#    still reclaimed) but never evicts a running pod to repack.
+#
+# 2. Sandbox capability. Every node this pool creates must be able to host a
+#    Nitro Sandbox, so a sandbox pod never waits for a second round of
+#    provisioning after landing on a node that cannot run one.
+#
+# Everything else mirrors the built-in pool: on-demand only, amd64 Linux,
+# c/m/r families newer than generation 4, a 10% disruption budget, a 336h node
+# lifetime and a 24h termination grace period.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: workshop-general-purpose
+spec:
+  disruption:
+    # Mirrors the built-in pool: at most 10% of nodes disrupted at once.
+    budgets:
+      - nodes: 10%
+    # WhenEmpty (not WhenEmptyOrUnderutilized): reclaim a node only once nothing
+    # but daemonsets is left on it. This is the one setting the workshop needs
+    # changed — see note 1 above. `consolidateAfter` still applies, so an
+    # emptied node is released 30s later rather than lingering.
+    consolidateAfter: 30s
+    consolidationPolicy: WhenEmpty
+  template:
+    metadata: {}
+    spec:
+      expireAfter: 336h
+      # The EKS-managed NodeClass that ships with Auto Mode. It exists as long
+      # as at least one built-in node pool is enabled, which is why base.tf
+      # keeps "system" rather than emptying `node_pools` entirely.
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: default
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - on-demand
+        - key: eks.amazonaws.com/instance-category
+          operator: In
+          values:
+            - c
+            - m
+            - r
+        - key: eks.amazonaws.com/instance-generation
+          operator: Gt
+          values:
+            - "4"
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+        - key: kubernetes.io/os
+          operator: In
+          values:
+            - linux
+        # Only provision instances that can host a Nitro Sandbox. This is the
+        # one requirement the built-in pool does not have.
+        #
+        # IF NOTHING SCHEDULES, LOOK HERE FIRST. This is the only general
+        # compute pool in the cluster, so an unsatisfiable requirement leaves
+        # every pod Pending rather than degrading quietly. Check what
+        # sandbox-capable nodes actually advertise:
+        #
+        #   kubectl get nodes -o json | jq '.items[].metadata.labels' | grep -i nitro
+        #   kubectl get nodepool workshop-general-purpose -o yaml   # .status.conditions
+        #
+        # If the key or value differs, correct it here. If Auto Mode turns out
+        # to express sandbox capability only as the schedulable
+        # `eks.amazonaws.com/nitro-sandbox` extended resource (which sandbox
+        # pods already request via `spec.overhead`) rather than as a node
+        # label, delete this requirement and instead narrow
+        # `instance-category` / `instance-generation` to the families that
+        # support sandboxing.
+        - key: eks.amazonaws.com/nitro-sandbox
+          operator: In
+          values:
+            - "true"
+      terminationGracePeriod: 24h0m0s

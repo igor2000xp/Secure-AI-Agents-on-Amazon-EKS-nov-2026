@@ -1,0 +1,120 @@
+# SandboxTemplate + SandboxWarmPool for the "Agents using a sandbox" lab.
+#
+# Applied by terraform/agent-sandbox.tf, which sed's __ECR__ to the account's
+# registry. The agent-sandbox MCP server claims from this pool; the controller
+# keeps `replicas` micro-VMs pre-booted so a claim attaches to a running sandbox
+# instead of paying a cold boot per tool call.
+#
+# This is the file that makes a vended sandbox a NITRO SANDBOX rather than an
+# ordinary pod. agent-sandbox supplies the lifecycle API (claim, bind, TTL, GC);
+# the two lines that supply the isolation boundary are runtimeClassName and
+# spec.overhead, below.
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: orders-analysis
+  namespace: agent-sandbox
+spec:
+  # Required for the MCP server's `in-cluster-service` connection mode: it
+  # resolves Sandbox.status.serviceFQDN, which is only populated when the
+  # template asks for a Service.
+  service: true
+
+  # NETWORK POLICY — read the warning before editing.
+  #
+  # Supplying spec.networkPolicy REPLACES every secure default the controller
+  # would otherwise generate. The default `Managed` policy admits only
+  # sandbox-router, which cannot proxy sandboxd's gRPC ProcessService, so the
+  # MCP server has to be admitted explicitly.
+  #
+  # Because the defaults are replaced, the egress list below is load-bearing by
+  # its ABSENCE: an omitted egress list denies all outbound traffic, which is
+  # exactly the air-gap this lab demonstrates. Do not add an egress rule here
+  # without meaning to — model-written code runs in this sandbox.
+  networkPolicy:
+    ingress:
+      # sandboxd's REST (files) and gRPC (exec) listeners, reachable only from
+      # the MCP server pod.
+      - from:
+          - podSelector:
+              matchLabels:
+                app: agent-sandbox-mcp-server
+            namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: default
+        ports:
+          - protocol: TCP
+            port: 8080
+          - protocol: TCP
+            port: 9090
+    # egress: deliberately absent -> all outbound denied. No DNS, no internet,
+    # no Bedrock, no IMDS, no other pod in the cluster.
+
+  podTemplate:
+    spec:
+      # No credentials in the sandbox: no AWS keys, no Kubernetes token.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+
+      # The whole opt-in to hardware isolation. Each sandbox boots as a
+      # first-level guest of the AWS Nitro hypervisor with its own kernel.
+      runtimeClassName: isolated-sandbox
+
+      # Per-pod micro-VM cost the scheduler must account for: one sandbox slot
+      # (an extended resource advertised by sandbox-capable nodes) plus the
+      # guest/hypervisor memory on top of the container's own request.
+      overhead:
+        eks.amazonaws.com/nitro-sandbox: "1"
+        memory: 256Mi
+
+      # A lingering sandbox holds a scarce per-node sandbox slot, so release it
+      # the moment the claim is deleted.
+      terminationGracePeriodSeconds: 0
+
+      securityContext:
+        runAsNonRoot: true
+        # The sandboxd base image owns /workspace as 1000:1000.
+        fsGroup: 1000
+
+      containers:
+        - name: sandboxd
+          # sandboxd + python3/pandas/matplotlib. Commands the MCP server runs
+          # execute in THIS container, so the analysis toolchain lives here.
+          image: __ECR__/python-runtime-sandbox:v2
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: 8080 # REST: filesystem + health
+            - containerPort: 9090 # gRPC: ProcessService (exec)
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+          resources:
+            # Nitro Sandboxes size the guest from REQUESTS, not limits: a
+            # sub-core CPU request rounds up to a whole vCPU, and the guest gets
+            # (memory request + the 256Mi overhead declared above).
+            requests:
+              cpu: "1"
+              memory: 768Mi
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: orders-analysis-pool
+  namespace: agent-sandbox
+spec:
+  sandboxTemplateRef:
+    name: orders-analysis
+  # One pre-booted sandbox. Usable concurrency is roughly one live sandbox per
+  # sandbox-capable node, so raising this also raises the node count Auto Mode
+  # provisions — and each replica holds an instance for the whole event.
+  replicas: 3

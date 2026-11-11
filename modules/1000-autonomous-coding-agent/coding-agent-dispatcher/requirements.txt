@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+httpx
+# The dispatcher claims sandboxes through the agent-sandbox control plane and
+# drives them over sandboxd. The [grpc] extra is REQUIRED, not optional:
+# commands.start() (the streamed exec this lab depends on) imports grpc lazily
+# and raises "install the 'grpc' extra" without it. Pinned to the same version
+# as the controller + CRDs (manifests/vendor/sources.yaml).
+k8s-agent-sandbox[grpc]==1.0.9
+# Still needed: server.py's token sweep and the Gitea client use neither, but
+# the SDK itself depends on the kubernetes client for the claim API.
+kubernetes

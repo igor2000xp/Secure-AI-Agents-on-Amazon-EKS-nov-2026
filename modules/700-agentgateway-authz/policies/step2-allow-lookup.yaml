@@ -1,0 +1,68 @@
+# Step 2 — allow the shared tool (lookup_order) for ANY authenticated persona.
+#
+# Same jwtAuthentication as step 1 (kept identical so applying step 2 is a clean
+# replacement of the cumulative state). The authz policy now Allows call_tool
+# for lookup_order regardless of persona; every OTHER tool is still denied
+# (deny-by-default from the single Allow rule).
+#
+# Expected: lookup_order WORKS for both sales-analyst and support-associate;
+# check_inventory / initiate_return still FAIL (403). Success here proves the
+# Cognito token propagates end to end (UI -> agent -> gateway).
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: cognito-jwks
+  namespace: agentgateway-system
+spec:
+  static:
+    host: __COGNITO_JWKS_HOST__
+    port: 443
+  policies:
+    tls: {}
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-authn
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - kind: Gateway
+      name: agentgateway
+      group: gateway.networking.k8s.io
+  traffic:
+    jwtAuthentication:
+      mode: Strict
+      providers:
+        - issuer: __COGNITO_ISSUER__
+          audiences:
+            - __COGNITO_CLIENT_ID__
+          jwks:
+            remote:
+              backendRef:
+                group: agentgateway.dev
+                kind: AgentgatewayBackend
+                name: cognito-jwks
+                namespace: agentgateway-system
+                port: 443
+              jwksPath: __COGNITO_JWKS_PATH__
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-tool-authz
+  namespace: default
+spec:
+  targetRefs:
+    - kind: AgentgatewayBackend
+      name: mcp-backend
+      group: agentgateway.dev
+  backend:
+    mcp:
+      authorization:
+        action: Allow
+        policy:
+          matchExpressions:
+            # Any authenticated persona may look orders up.
+            - 'mcp.tool.name == "lookup_order"'

@@ -1,0 +1,41 @@
+# Anthropic-input route to the existing Bedrock backend.
+#
+# Claude Code (ANTHROPIC_BASE_URL=.../anthropic) POSTs Anthropic Messages to
+# /anthropic/v1/messages. Envoy AI Gateway v1.0 accepts the Anthropic client
+# schema and translates to Bedrock's Converse API on the AWSBedrock backend.
+# We reuse the `bedrock` AIServiceBackend + BackendSecurityPolicy from
+# envoy-ai-gateway-bedrock.yaml (do NOT redefine them here).
+#
+# The client's Anthropic `model` field is surfaced as the x-ai-eg-model header;
+# modelNameOverride rewrites the alias to the real Bedrock model id.
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: bedrock-anthropic
+  namespace: envoy-ai-gateway-system
+spec:
+  # If v1.0 requires the input schema declared explicitly on the route, this is
+  # where it goes (verified in Step 3 via `kubectl explain`). Candidate:
+  #   schema:
+  #     name: Anthropic
+  parentRefs:
+    - name: envoy-ai-gateway
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  rules:
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: claude-sonnet
+      backendRefs:
+        - name: bedrock
+          modelNameOverride: us.anthropic.claude-sonnet-5-5
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: claude-haiku
+      backendRefs:
+        - name: bedrock
+          modelNameOverride: us.anthropic.claude-haiku-4-5-20251001-v1:0

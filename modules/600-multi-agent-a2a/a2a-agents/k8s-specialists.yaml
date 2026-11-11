@@ -1,0 +1,179 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-agent
+  template:
+    metadata:
+      labels:
+        app: order-agent
+    spec:
+      serviceAccountName: agent
+      containers:
+        - name: order-agent
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/order-agent:v1
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+          # MODEL_BASE_URL / MODEL_ID / MODEL_API_KEY come from agent-config
+          # (same as the 500 customer-agent). Without this the agent code's
+          # MODEL_BASE_URL default (localhost:4000) is used and every LLM call
+          # fails on EKS. (Replaces the old LITELLM_* env — the code reads
+          # MODEL_* since the Envoy AI Gateway switch.)
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            # Reach the MCP server THROUGH agentgateway (route defined in
+            # 500-agent-tools-mcp/mcp-server/k8s.yaml).
+            - name: MCP_SERVER_URL
+              value: "http://agentgateway.agentgateway-system.svc.cluster.local/mcp"
+          resources:
+            requests: { cpu: "256m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-agent
+spec:
+  selector:
+    app: order-agent
+  ports:
+    - port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: product-agent
+  template:
+    metadata:
+      labels:
+        app: product-agent
+    spec:
+      serviceAccountName: agent
+      containers:
+        - name: product-agent
+          image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/product-agent:v1
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8082
+          # MODEL_* from agent-config (see order-agent above). Replaces the old
+          # LITELLM_* env — the agent code reads MODEL_BASE_URL/MODEL_ID/
+          # MODEL_API_KEY since the Envoy AI Gateway switch.
+          envFrom:
+            - configMapRef:
+                name: agent-config
+            # product_agent traces its Milvus search with @observe, so it needs
+            # the Langfuse credentials. They come from a Secret, not the
+            # ConfigMap. (order-agent above does not trace, so it has no
+            # secretRef.)
+            - secretRef:
+                name: langfuse-keys
+          env:
+            - name: MILVUS_URI
+              value: "http://milvus.milvus.svc.cluster.local:19530"
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "1", memory: "2Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-agent
+spec:
+  selector:
+    app: product-agent
+  ports:
+    - port: 8082
+      targetPort: 8082
+---
+# Route A2A traffic to the two specialists THROUGH the cluster-internal
+# agentgateway proxy instead of the orchestrator dialing their Services
+# directly. The orchestrator sets ORDER_AGENT_URL / PRODUCT_AGENT_URL to
+# http://agentgateway.../order-agent and /product-agent.
+#
+# Each specialist gets its own AgentgatewayBackend (a2a type — no Service
+# appProtocol needed) and its own stably-named HTTPRoute, so a future
+# AgentgatewayPolicy (authn/authz or tracing) can targetRef a specific agent's
+# route. The A2A server requires traffic on the root path, so a URLRewrite
+# strips the /<agent> prefix to "/".
+#
+# NOTE: order_agent.py / product_agent.py advertise an absolute agent-card `url`
+# (e.g. http://order-agent...:8081). Our orchestrator constructs
+# A2AClient(url=...) explicitly and does NOT consult the card, so those values
+# are non-functional here; update them for spec-correctness in a later pass.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: order-agent-backend
+spec:
+  a2a:
+    host: order-agent.default.svc.cluster.local
+    port: 8081
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: order-agent-a2a
+spec:
+  parentRefs:
+    - name: agentgateway
+      namespace: agentgateway-system
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /order-agent
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: order-agent-backend
+          group: agentgateway.dev
+          kind: AgentgatewayBackend
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: product-agent-backend
+spec:
+  a2a:
+    host: product-agent.default.svc.cluster.local
+    port: 8082
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: product-agent-a2a
+spec:
+  parentRefs:
+    - name: agentgateway
+      namespace: agentgateway-system
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /product-agent
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: product-agent-backend
+          group: agentgateway.dev
+          kind: AgentgatewayBackend

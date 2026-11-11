@@ -1,0 +1,85 @@
+# Step 1 — authenticate + DENY ALL tool calls (deny-by-default).
+#
+# Two AgentgatewayPolicies:
+#   A) jwtAuthentication on the agentgateway Gateway — validates the Cognito
+#      access token forwarded by the agent (Authorization: Bearer). An invalid /
+#      missing token is rejected here (401) before any tool logic.
+#   B) backend.mcp.authorization on the mcp-backend AgentgatewayBackend — an
+#      Allow policy whose expression matches NOTHING. Per agentgateway semantics,
+#      once >=1 Allow rule exists, every call_tool not matched by an Allow is
+#      denied ("unauthorized tool call", 403). So this denies ALL tools even for
+#      a valid token.
+#
+# Expected: agent's MCP tool calls FAIL (403) for both personas. This also
+# proves the token is reaching the gateway (else you'd see 401, not 403).
+#
+# __COGNITO_ISSUER__ / __COGNITO_JWKS_HOST__ / __COGNITO_JWKS_PATH__ /
+# __COGNITO_CLIENT_ID__ are substituted with this event's Cognito pool values
+# (see the lab; terraform outputs cognito_issuer / cognito_jwks_host /
+# cognito_jwks_path / cognito_client_id).
+---
+# agentgateway validates JWTs against a REMOTE JWKS that it reaches via a
+# backendRef (NOT a bare URL), so give it a static Backend for the Cognito JWKS
+# host. policies.tls:{} makes the gateway open TLS to :443 using the system trust
+# store with auto-SNI (Cognito serves a public cert).
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: cognito-jwks
+  namespace: agentgateway-system
+spec:
+  static:
+    host: __COGNITO_JWKS_HOST__
+    port: 443
+  policies:
+    tls: {}
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-authn
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - kind: Gateway
+      name: agentgateway
+      group: gateway.networking.k8s.io
+  # JWT authn lives under `traffic` (it runs before other traffic policies), and
+  # `mode` sits on jwtAuthentication itself (not per-provider). Strict rejects a
+  # missing/invalid token with 401 before any tool logic.
+  traffic:
+    jwtAuthentication:
+      mode: Strict
+      providers:
+        - issuer: __COGNITO_ISSUER__
+          audiences:
+            - __COGNITO_CLIENT_ID__
+          jwks:
+            remote:
+              backendRef:
+                group: agentgateway.dev
+                kind: AgentgatewayBackend
+                name: cognito-jwks
+                namespace: agentgateway-system
+                port: 443
+              jwksPath: __COGNITO_JWKS_PATH__
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-tool-authz
+  namespace: default
+spec:
+  targetRefs:
+    - kind: AgentgatewayBackend
+      name: mcp-backend
+      group: agentgateway.dev
+  backend:
+    mcp:
+      authorization:
+        # Allow rule that matches no tool → with >=1 Allow present, every tool
+        # call is denied. Deny-by-default.
+        action: Allow
+        policy:
+          matchExpressions:
+            - 'false'
